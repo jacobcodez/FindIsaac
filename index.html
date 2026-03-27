@@ -1154,56 +1154,91 @@ async function initOrientation() {
 }
 
 // Smoothing for orientation values
-let smoothAz = 0, smoothAlt = -90;
-const SMOOTH = 0.3; // lower = smoother
+let smoothAz = 0, smoothAlt = -45;
+const SMOOTH = 0.25;
 
 function handleOrientation(e) {
   if (e.alpha === null && e.beta === null) return;
 
-  const alpha = e.alpha || 0;
-  const beta = e.beta || 0;   // -180..180
-  const gamma = e.gamma || 0; // -90..90
+  const alphaDeg = e.alpha || 0;
+  const betaDeg  = e.beta  || 0;
+  const gammaDeg = e.gamma || 0;
 
-  // --- COMPASS HEADING ---
-  let heading;
-  if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
-    heading = e.webkitCompassHeading; // iOS: true north heading
-  } else if (e.absolute || state.useAbsolute) {
-    heading = (360 - alpha) % 360; // absolute orientation
-  } else {
-    heading = (360 - alpha) % 360; // relative, best we can do
-  }
+  const a = toRad(alphaDeg);
+  const b = toRad(betaDeg);
+  const g = toRad(gammaDeg);
 
-  // --- ALTITUDE (tilt) ---
-  // Device orientations when using rear camera pointing down:
-  //   Phone upright (screen facing you): beta ≈ 90  → horizon
-  //   Phone tilted 45° forward:          beta ≈ 45  → 45° below horizon
-  //   Phone flat face-up:                beta ≈ 0   → straight down
-  //   Phone flat face-down:              beta ≈ ±180 → straight down (inverted)
+  const sa = Math.sin(a), ca = Math.cos(a);
+  const sb = Math.sin(b), cb = Math.cos(b);
+  const sg = Math.sin(g), cg = Math.cos(g);
+
+  // ---- ROTATION MATRIX R = Rz(a) · Rx(b) · Ry(g) ----
+  // Camera looks along device -Z. Direction in world = R · [0, 0, -1]
+  // World frame: x=East, y=North, z=Up (W3C spec)
   //
-  // We want: altitude -90 = straight down, 0 = horizon
-  // So: altitude = beta - 90
+  // R's third column (R · [0,0,1]) then negated:
+  const camEast  =  ca * sb * cg - sa * sg;
+  const camNorth =  sa * sb * cg + ca * sg;
+  const camUp    =  cb * cg;
+  // camUp > 0 → camera points upward, camUp < 0 → camera points downward
 
-  let altitude;
-  if (beta >= 0 && beta <= 180) {
-    altitude = beta - 90; // 0→-90 (flat=down), 90→0 (upright=horizon)
-  } else {
-    // beta < 0: phone is tilted backwards past vertical
-    // Map -180→-90 (face down inverted), -90→0 would be weird
-    // Clamp to useful range
-    altitude = Math.max(-90, beta - 90);
-  }
-
-  // Clamp
+  // ---- ALTITUDE ----
+  // Elevation from horizontal plane. Negative = looking down.
+  const horizMag = Math.sqrt(camEast * camEast + camNorth * camNorth);
+  let altitude = toDeg(Math.atan2(-camUp, horizMag));
+  // camUp > 0 (looking up) → -camUp < 0 → altitude < 0 → we want 0
+  // camUp < 0 (looking down) → -camUp > 0 → altitude > 0 → but our convention is negative for down
+  // So flip sign:
+  // Actually wait: atan2(-camUp, horiz) when camUp<0: -camUp>0, so result is positive.
+  // We want looking down = negative altitude. So negate:
+  altitude = -altitude;
   altitude = Math.max(-90, Math.min(0, altitude));
 
-  // Apply heading correction for gamma when phone is tilted
-  // When the phone tilts left/right (gamma), it shifts the effective heading
-  const gammaCorrection = gamma * Math.cos(beta * DEG) * 0.5;
-  heading = (heading + gammaCorrection + 360) % 360;
+  // ---- HEADING ----
+  // The matrix-derived heading from the camera's horizontal direction
+  const matrixHeading = (toDeg(Math.atan2(camEast, camNorth)) + 360) % 360;
+
+  let heading;
+
+  if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
+    // iOS: alpha is relative to an arbitrary reference, NOT magnetic north.
+    // webkitCompassHeading = true compass heading of the TOP of the phone.
+    //
+    // Strategy: when phone is upright (b=90°, g=0°), the matrix heading
+    // reduces to atan2(ca, sa) = (90° - alphaDeg). We know the TRUE heading
+    // should be webkitCompassHeading. So the constant offset is:
+    //   offset = webkitCompassHeading - (90 - alphaDeg)
+    // This offset stays the same regardless of tilt, so we apply it
+    // to the full matrix heading at any orientation.
+    const uprightHeading = ((90 - alphaDeg) % 360 + 360) % 360;
+    const offset = e.webkitCompassHeading - uprightHeading;
+    heading = (matrixHeading + offset + 720) % 360;
+  } else {
+    // Android absolute or relative: alpha is measured from North
+    // In W3C spec, alpha increases counterclockwise from above.
+    // When phone is upright facing North: alpha=0, beta=90, gamma=0
+    //   camEast = 0*1*1 - 0 = 0
+    //   camNorth = 0*1*1 + 1*0 = 0 ... wait that gives 0,0
+    //   Actually: ca=1, sa=0, sb=1, cb=0, sg=0, cg=1
+    //   camEast = 1*1*1 - 0*0 = 1
+    //   camNorth = 0*1*1 + 1*0 = 0
+    //   heading = atan2(1, 0) = 90° ... but should be 0° (North)
+    //
+    // The issue: W3C alpha=0 means device x-axis points East when upright,
+    // but compass north = 360-alpha on most Android browsers.
+    // So for Android we apply a 90° correction:
+    heading = (matrixHeading - 90 + 360) % 360;
+    // Verify: alpha=0, upright → matrixHeading=90° → 90-90=0° = North ✓
+    // alpha=90 (phone turned 90° CCW) → facing West? 
+    //   sa=1, ca=0: camEast = 0 - 1*0 = 0, camNorth = 1*1 + 0 = 1
+    //   matrixHeading = atan2(0,1) = 0° → 0-90 = -90 = 270° = West
+    //   But alpha=90 CCW from N means phone points West. ✓
+    //
+    // For non-absolute alpha, this is still the best we can do.
+    // On absolute events, alpha IS referenced to north, just counterclockwise.
+  }
 
   // Smooth
-  // Handle azimuth wraparound for smoothing
   let dAz = heading - smoothAz;
   if (dAz > 180) dAz -= 360;
   if (dAz < -180) dAz += 360;
